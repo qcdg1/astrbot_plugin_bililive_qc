@@ -1,0 +1,12 @@
+name: astrbot_plugin_bililive_qc
+display_name: bilibili上下播通知
+desc: 免登录监控B站直播间开播/下播，在QQ群发送卡片式通知
+short_desc: bilibili上下播通知，免登录，支持卡片渲染
+version: 1.0.0
+author: qcdg
+repo: https://github.com/qcdg1/astrbot_plugin_bililive_qc
+tags:
+  - bilibili
+  - 直播监控
+support_platforms:
+  - aiocqhttp

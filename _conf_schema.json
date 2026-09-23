@@ -1,0 +1,33 @@
+{
+  "rooms": {
+    "description": "直播间配置，每行一个，格式：房间号|自定义昵称|群号1|群号2|群号3",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": ["21987615|某主播|123456789|987654321"],
+    "hint": "群号可写多个，用 | 隔开（也兼容逗号 / 顿号 / 空格）。示例：21987615|某主播|123456789|987654321 —— 该主播开播/下播只推送到这两个群，不同主播可配置不同群。该群列表同时决定 liveinfo 指令在该群能看到哪些主播（群内只显示推送目标含本群的主播，私聊显示全部）。"
+  },
+  "check_interval": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "建议不低于 60 秒，避免触发 B 站风控。"
+  },
+  "render_card": {
+    "description": "渲染合成图（开播通知的卡片、/liveinfo 的长条信息图）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后开播通知只发送文字 + 原始封面图，/liveinfo 也只发文字。"
+  },
+  "font_path": {
+    "description": "卡片中文字体文件路径（留空自动探测）",
+    "type": "string",
+    "default": "",
+    "hint": "Windows 默认探测 C:\\Windows\\Fonts\\msyhbd.ttc；Linux 需装 fonts-noto-cjk，或手动填入字体路径。"
+  },
+  "emoji_font_path": {
+    "description": "卡片 emoji 字体文件路径（留空自动探测）",
+    "type": "string",
+    "default": "",
+    "hint": "Windows 默认探测 C:\\Windows\\Fonts\\seguiemj.ttf；Linux 可装 fonts-noto-color-emoji。"
+  }
+}
