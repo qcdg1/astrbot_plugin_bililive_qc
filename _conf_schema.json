@@ -13,10 +13,10 @@
     "hint": "建议不低于 60 秒，避免触发 B 站风控。"
   },
   "render_card": {
-    "description": "渲染合成图（开播通知的卡片、/liveinfo 的长条信息图）",
+    "description": "渲染合成图（开播卡片、liveinfo/livelist 的长条信息图）",
     "type": "bool",
     "default": true,
-    "hint": "关闭后开播通知只发送文字 + 原始封面图，/liveinfo 也只发文字。"
+    "hint": "关闭后开播通知只发送文字 + 原始封面图，liveinfo 也只发文字；livelist/livelistall 会退回文字版并附提示。"
   },
   "font_path": {
     "description": "卡片中文字体文件路径（留空自动探测）",

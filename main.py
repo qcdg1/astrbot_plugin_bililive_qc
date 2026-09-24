@@ -20,6 +20,9 @@ BILI_LIVE_INFO_API = "https://api.live.bilibili.com/room/v1/Room/get_info"
 BILI_MASTER_INFO_API = "https://api.live.bilibili.com/live_user/v1/Master/info"
 BILI_RELATION_API = "https://api.bilibili.com/x/relation/stat"
 BILI_NAV_API = "https://api.bilibili.com/x/web-interface/nav"
+# 直播间网页；SSR 数据里带 watched_show（累计观看），免登录可取
+BILI_LIVE_PAGE = "https://live.bilibili.com/{room_id}"
+SSR_DATA_KEY = "__NEPTUNE_IS_MY_WAIFU__"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -57,6 +60,34 @@ def parse_live_time(live_time) -> str:
     return str(live_time)
 
 
+def _first_not_none(*values):
+    """返回第一个不是 None 的值；全为 None 时返回 None。
+
+    计数类字段（粉丝/累计观看/点赞）不能用 `or` 兜底：0 是有效值，
+    用 `or` 会把真实的 0 当成"没拿到"而错误地跳到下一个来源。
+    """
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
+def _peak(*values):
+    """返回所有非 None 值中的最大值；全为 None 时返回 None。
+
+    目前用于「人气」的合并：B站的 online 是**波动的热度快照**（会涨会跌），
+    没有"最终值"的概念，下播后还会归 0。
+    用整场峰值代表"这场直播最高到过多少热度"最有意义。
+
+    注意：累计观看 / 累计点赞是**单调递增计数器**，不要用 _peak，
+    它们的正确取法是"最后一次"（见 _first_not_none 与监控循环）。
+    """
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return None
+    return max(nums)
+
+
 def fmt_minute(dt) -> str:
     """时间展示到分钟：2026-09-23 16:45:56 -> 2026-09-23 16:45"""
     if dt is None:
@@ -83,6 +114,113 @@ def format_duration(seconds: int) -> str:
     if hours > 0:
         return f"{hours}小时{minutes}分钟" if minutes else f"{hours}小时"
     return f"{minutes}分钟"
+
+
+def parse_ssr_state(html: str) -> dict:
+    """从直播间网页 HTML 里抠出 SSR 注入的状态对象。
+
+    页面里有 `window.__NEPTUNE_IS_MY_WAIFU__={...}`，后面紧跟其它脚本。
+    这里用 JSONDecoder.raw_decode 精确切出第一个完整 JSON 对象，
+    避免贪婪正则把后面的脚本内容一起吃进来。
+    """
+    if not html:
+        return {}
+    key = f"window.{SSR_DATA_KEY}="
+    idx = html.find(key)
+    if idx < 0:
+        return {}
+    start = idx + len(key)
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(html[start:].lstrip())
+    except (ValueError, TypeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def parse_ssr_extra(state: dict) -> dict:
+    """从 SSR 状态里额外取标题 / B站昵称 / 头像 / 人气值 / 点赞数。
+
+    实测路径（roomInfoRes.data）：
+      room_info.title                      -> 直播标题
+      room_info.online                     -> 人气值（**加权热度，不是人数**）
+      anchor_info.base_info.uname          -> B站真实昵称
+      anchor_info.base_info.face           -> 主播头像
+      like_info_v3.total_likes             -> 本场点赞数（真实计数）
+
+    注意 online 的口径：B站官方把它标为「人气」，它是**加权人气值**（热度），
+    **不是实时在线人数**。B站不对外暴露真实并发在线人数。
+    真实人数口径是 watched_show 的「N人看过」。渲染层把 online 标为「N 人气」，
+    绝不会标成「当前观看/在线人数」，避免和「累计观看」产生"当前比累计还多"的矛盾。
+
+    这些字段免登录可取，比 Master/info 更稳（不依赖 uid / 粉丝接口）。
+    """
+    data = ((state or {}).get("roomInfoRes") or {}).get("data") or {}
+    room_info = data.get("room_info") or {}
+    base_info = ((data.get("anchor_info") or {}).get("base_info")) or {}
+    like_info = data.get("like_info_v3") or {}
+    return {
+        "title": room_info.get("title") or "",
+        "online": room_info.get("online") or 0,
+        # total_likes 缺失时返回 None（而非 0），让渲染层显示 "—"；
+        # 接口明确给了 0 就是真的 0（本场还没人点赞），原样保留。
+        "likes": like_info.get("total_likes"),
+        "uname": base_info.get("uname") or "",
+        "face": base_info.get("face") or "",
+    }
+
+
+def parse_watched_show(state: dict):
+    """从 SSR 状态里取累计观看人数；拿不到时返回 None（不是 0）。
+
+    实测路径：roomInfoRes.data.watched_show.num
+    watched_show 是对象（{switch, num, text_large, ...}），不是数字，
+    所以不能直接 int()；这里两种形态都兼容。
+
+    返回 None 表示"页面里根本没有这个字段/主播关掉了展示"，
+    渲染层会显示 "—"；返回 0 表示接口明确给的就是 0。
+    """
+    data = ((state or {}).get("roomInfoRes") or {}).get("data") or {}
+    ws = data.get("watched_show")
+    if isinstance(ws, dict):
+        # switch 为 false 表示主播主动关闭了累计观看展示 → 视为拿不到
+        if ws.get("switch") is False:
+            return None
+        num = ws.get("num")
+        if num in (None, ""):
+            return None
+        # 可能是 "4.1万" 这类文本
+        if isinstance(num, str):
+            return _parse_count_text(num)
+        try:
+            return int(num)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(ws, (int, float)):
+        return int(ws)
+    if isinstance(ws, str):
+        return _parse_count_text(ws)
+    return None
+
+
+def _parse_count_text(text):
+    """把 "41752" / "4.1万" / "1.2亿" 这类文本还原成整数。解析失败返回 None。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    m = re.match(r"^([\d.]+)\s*([万亿wW]?)$", text)
+    if not m:
+        digits = re.sub(r"\D", "", text)
+        return int(digits) if digits else None
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return None
+    unit = m.group(2)
+    if unit in ("万", "w", "W"):
+        num *= 10000
+    elif unit == "亿":
+        num *= 100000000
+    return int(num)
 
 
 @register("bililive_qc", "qcdg", "bilibili上下播通知", "1.0.0")
@@ -317,6 +455,32 @@ class BiliLiveMonitor(Star):
                     if old_status is None:
                         continue
 
+                    # 直播中：每轮刷新缓存里的字段。
+                    #
+                    # 三个字段的"正确取法"不同（数据口径见下）：
+                    #   watched_show 累计观看：单调递增计数器，**取最后一次**即可
+                    #                （下播后 SSR 仍保留本场最终值，实时值就是最终值）
+                    #   likes        累计点赞：单调递增计数器，**取最后一次**
+                    #                （下播瞬间 B站 会清零，所以要靠直播期间持续刷新，
+                    #                  但取"最后一次"而非"最大值"才是本场真实点赞数）
+                    #   online       人气：**波动**的快照值（会涨会跌），下播归 0，
+                    #                没有"最终值"概念 → **取整场峰值**（最高热度）
+                    if (
+                        live_status == 1
+                        and old_status == 1
+                        and room_key in self.live_on_info
+                    ):
+                        cached_live = self.live_on_info[room_key]
+                        for _k in ("watched_show", "likes"):
+                            _new = info.get(_k)
+                            if _new is not None:
+                                cached_live[_k] = _new
+                        _on = info.get("online")
+                        if _on is not None:
+                            _old_on = cached_live.get("online")
+                            if _old_on is None or _on > _old_on:
+                                cached_live["online"] = _on
+
                     if old_status == 0 and live_status == 1:
                         start_dt = None
                         if live_time_str and live_time_str != "未知":
@@ -333,8 +497,14 @@ class BiliLiveMonitor(Star):
                         self.live_on_info[room_key] = {
                             "bili_name": info.get("bili_name") or "",
                             "title": info.get("title") or "",
-                            "follower": info.get("follower") or 0,
-                            "watched_show": info.get("watched_show") or 0,
+                            # 计数类字段用 _first_not_none 而不是 `or 0`：
+                            # 开播瞬间 SSR 可能还没返回，此时值是 None（"暂无数据"），
+                            # 用 `or 0` 会把它冻成 0，下播时就会错误显示 0。
+                            # 保持 None 的话，下播还能用 info 里的实时值兜底。
+                            "follower": _first_not_none(info.get("follower")),
+                            "watched_show": _first_not_none(info.get("watched_show")),
+                            "likes": _first_not_none(info.get("likes")),
+                            "online": info.get("online") or 0,
                             "face": info.get("face") or "",
                         }
                         await self._notify_live_on(
@@ -392,6 +562,55 @@ class BiliLiveMonitor(Star):
             resp.raise_for_status()
             return await resp.json()
 
+    async def _fetch_ssr_data(self, room_id: str) -> dict:
+        """抓直播间网页的 SSR 数据，一次请求拿到累计观看 + 标题 + 昵称 + 头像。
+
+        注意：room/v1/Room/get_info **不返回** watched_show，也不返回
+        face / uname。这三个字段都在直播间网页的 SSR 数据里：
+
+            watched_show -> roomInfoRes.data.watched_show.num
+            title        -> roomInfoRes.data.room_info.title
+            uname        -> roomInfoRes.data.anchor_info.base_info.uname
+            face         -> roomInfoRes.data.anchor_info.base_info.face
+
+        关键结论：**免登录也能拿到**（无需 cookie、无需 buvid）。
+        抓不到时返回空 dict，由调用方走各自的兜底，不影响主流程。
+        """
+        empty = {
+            "watched_show": None, "title": "", "uname": "", "face": "",
+            "online": 0, "likes": None,
+        }
+        if self.session is None:
+            return empty
+        try:
+            url = BILI_LIVE_PAGE.format(room_id=room_id)
+            async with self.session.get(url, headers=self._headers()) as resp:
+                if resp.status != 200:
+                    logger.debug(
+                        f"[BiliLiveMonitor] 直播间 {room_id} 网页返回 {resp.status}"
+                    )
+                    return empty
+                html = await resp.text(errors="ignore")
+        except Exception as e:
+            logger.debug(f"[BiliLiveMonitor] 抓取直播间 {room_id} 网页失败: {e}")
+            return empty
+
+        state = parse_ssr_state(html)
+        if not state:
+            logger.debug(
+                f"[BiliLiveMonitor] 直播间 {room_id} 未能解析页面 SSR 数据"
+                f"（B站前端结构可能已变更）"
+            )
+            return empty
+
+        out = {"watched_show": parse_watched_show(state)}
+        out.update(parse_ssr_extra(state))
+        logger.debug(
+            f"[BiliLiveMonitor] 直播间 {room_id} SSR: 累计观看={out['watched_show']}, "
+            f"昵称={out['uname']!r}, 标题={out['title'][:20]!r}, 有头像={bool(out['face'])}"
+        )
+        return out
+
     async def _fetch_live_status(self, room_id: str) -> dict:
         """拉取直播间信息。返回 dict，包含卡片渲染需要的全部字段。"""
         params = {"room_id": room_id}
@@ -418,14 +637,40 @@ class BiliLiveMonitor(Star):
             "area_name": room_info.get("area_name") or "",
             "parent_area_name": room_info.get("parent_area_name") or "",
             "online": room_info.get("online") or 0,
-            "watched_show": room_info.get("watched_show") or 0,
+            # get_info 不返回 watched_show / likes / face / uname，这里先置 None
+            # 表示"还没有值"，下面用直播页 SSR 与 Master/info 补齐（见 _fetch_ssr_data）。
+            # 用 None 而不是 0：渲染层据此区分"拿不到"（显示 —）和"真的是 0"（显示 0）。
+            "watched_show": None,
+            "likes": None,
             "description": room_info.get("description") or "",
             "tags": room_info.get("tags") or "",
-            "follower": 0,
+            "follower": None,
             # 主播头像（get_info 的 face 字段）与 B 站真实昵称
             "face": room_info.get("face") or "",
             "bili_name": room_info.get("uname") or "",
         }
+
+        # get_info 不返回 watched_show / face / uname / likes，这些都在直播页 SSR 里。
+        # 一次请求同时补齐：累计观看 + 点赞数 + 标题 + B站昵称 + 头像。
+        #
+        # 注意：**下播（live_status==0）时也要抓**。实测已下播的房间，
+        # 直播页 SSR 里 watched_show / total_likes 仍然保留着刚刚那场的最终值
+        # （不像 get_info 会清零），正好用来给下播通知做"本场结算"。
+        # 而且下播款本来就只显示这几个数，不抓就只剩缓存里的开播瞬间值。
+        ssr_data = await self._fetch_ssr_data(room_id)
+        # SSR 抓到了就是真实值（含 0，开播瞬间点赞可能就是 0），直接采用
+        if ssr_data.get("watched_show") is not None:
+            info["watched_show"] = ssr_data["watched_show"]
+        if ssr_data.get("likes") is not None:
+            info["likes"] = ssr_data["likes"]
+        info["bili_name"] = info["bili_name"] or (ssr_data.get("uname") or "")
+        info["face"] = info["face"] or (ssr_data.get("face") or "")
+        # get_info 的 online 偶发返回 0（接口缓存/风控），用网页值兜底
+        if not info["online"]:
+            info["online"] = ssr_data.get("online") or 0
+        # 标题以 get_info 为准；它没给时再用网页兜底
+        if not info["title"] or info["title"] == "无标题":
+            info["title"] = ssr_data.get("title") or info["title"]
 
         # 主播粉丝数 + 昵称/头像兜底（免登录接口，失败不影响主流程）
         if uid:
@@ -434,7 +679,9 @@ class BiliLiveMonitor(Star):
                     BILI_RELATION_API, {"vmid": uid}, retry_on_412=False
                 )
                 if rel.get("code") == 0:
-                    info["follower"] = (rel.get("data") or {}).get("follower") or 0
+                    fv = (rel.get("data") or {}).get("follower")
+                    if fv is not None:
+                        info["follower"] = fv
             except Exception as e:
                 logger.debug(f"[BiliLiveMonitor] 获取主播粉丝数失败: {e}")
 
@@ -452,6 +699,14 @@ class BiliLiveMonitor(Star):
                         )
                 except Exception as e:
                     logger.debug(f"[BiliLiveMonitor] 获取主播信息失败: {e}")
+
+        # 最后兜底：uid 为空或 Master/info 抽风时，回落到直播页 SSR
+        # （未开播时上面没抓过，这里才真正发请求）
+        if not info["face"] or not info["bili_name"]:
+            if not ssr_data:
+                ssr_data = await self._fetch_ssr_data(room_id)
+            info["bili_name"] = info["bili_name"] or (ssr_data.get("uname") or "")
+            info["face"] = info["face"] or (ssr_data.get("face") or "")
 
         return info
 
@@ -487,8 +742,12 @@ class BiliLiveMonitor(Star):
                     area_name=info.get("area_name") or "",
                     parent_area_name=info.get("parent_area_name") or "",
                     online=info.get("online") or 0,
-                    watched_show=info.get("watched_show") or 0,
-                    follower=info.get("follower") or 0,
+                    # 开播卡片目前不展示累计观看/点赞（开播瞬间≈0），
+                    # 但仍原样透传 None/0，保持和长条图、下播图口径一致，
+                    # 以后卡片想加回来不必再改数据层。
+                    watched_show=info.get("watched_show"),
+                    likes=info.get("likes"),
+                    follower=info.get("follower"),
                     live_time_text=fmt_minute(info.get("live_time") or ""),
                     room_id=str(room_id_int),
                     live_url=live_url,
@@ -547,11 +806,29 @@ class BiliLiveMonitor(Star):
                 # 优先用开播时缓存的信息（下播后 get_info 的标题/头像可能已变或为空）
                 bili_name = cached.get("bili_name") or info.get("bili_name") or ""
                 title = cached.get("title") or info.get("title") or ""
-                follower = cached.get("follower") or info.get("follower") or 0
-                watched_show = (
-                    cached.get("watched_show") or info.get("watched_show") or 0
-                )
                 avatar_url = cached.get("face") or info.get("face") or ""
+
+                # 计数类字段的下播取法（按各自数据口径）：
+                #
+                #   watched_show 累计观看：下播后 SSR 仍保留本场最终值，
+                #                 且监控循环已把"最后一次"写进缓存 → 两者等价，取谁都行
+                #   likes        累计点赞：下播瞬间被 B站 清零（实时值=0），
+                #                 **必须优先用缓存**（缓存里是直播期间最后一次的真实值）
+                #   online       人气：波动值，下播归 0，
+                #                 **取缓存里的整场峰值**（最高热度）
+                #
+                # 缓存为空（比如插件中途启动、没赶上直播）时回退实时值。
+                # 用 _first_not_none / _peak 而不是 `or`：0 是有效值，不能被吞掉。
+                follower = _first_not_none(
+                    info.get("follower"), cached.get("follower")
+                )
+                watched_show = _first_not_none(
+                    cached.get("watched_show"), info.get("watched_show")
+                )
+                likes = _first_not_none(cached.get("likes"), info.get("likes"))
+                # 人气取峰值；保留 None 语义（整场都没拿到）→ 不画胶囊；
+                # 拿到过 0 也是有效值（真的没人气）。
+                online = _peak(cached.get("online"), info.get("online"))
 
                 image_bytes = await card_renderer.render_strip_row_async(
                     session=self.session,
@@ -563,6 +840,8 @@ class BiliLiveMonitor(Star):
                     live_status=0,
                     follower=follower,
                     watched_show=watched_show,
+                    likes=likes,
+                    online=online,
                     live_time_text=start_text,
                     end_time_text=end_text,
                     duration_text=duration_text,
@@ -690,20 +969,48 @@ class BiliLiveMonitor(Star):
     # ---------- 指令：查询状态 ----------
     @filter.command("liveinfo")
     async def liveinfo(self, event: AstrMessageEvent):
-        """群内查询：只显示「推送目标包含本群」的主播。"""
-        async for r in self._render_liveinfo(event, show_all=False):
+        """群内查询：文字 + 长条图。只显示「推送目标包含本群」的主播。"""
+        async for r in self._render_liveinfo(event, show_all=False, image_only=False):
             yield r
 
     @filter.command("liveinfoall")
     async def liveinfoall(self, event: AstrMessageEvent):
-        """管理员指令：查看全部主播，忽略当前群限制。"""
+        """管理员指令：查看全部主播（忽略本群限制），文字 + 长条图。"""
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 该指令仅管理员可用。")
             return
-        async for r in self._render_liveinfo(event, show_all=True):
+        async for r in self._render_liveinfo(event, show_all=True, image_only=False):
             yield r
 
-    async def _render_liveinfo(self, event: AstrMessageEvent, show_all: bool = False):
+    @filter.command("livelist")
+    async def livelist(self, event: AstrMessageEvent):
+        """群内查询：只发长条图，不带文字。同样按本群过滤。"""
+        async for r in self._render_liveinfo(event, show_all=False, image_only=True):
+            yield r
+
+    @filter.command("livelistall")
+    async def livelistall(self, event: AstrMessageEvent):
+        """管理员指令：只发长条图，忽略本群限制，展示全部主播。"""
+        if not self._is_admin(event):
+            yield event.plain_result("⚠️ 该指令仅管理员可用。")
+            return
+        async for r in self._render_liveinfo(event, show_all=True, image_only=True):
+            yield r
+
+    async def _render_liveinfo(
+        self,
+        event: AstrMessageEvent,
+        show_all: bool = False,
+        image_only: bool = False,
+    ):
+        """四个查询指令共用的实现。
+
+        show_all   : True 时忽略本群限制，展示全部主播（管理员）
+        image_only : True 时只发长条图，不带文字（/livelist 系列）
+        """
+        all_cmd = "/livelistall" if image_only else "/liveinfoall"
+        tag = "livelist" if image_only else "liveinfo"
+
         rooms = self.config.get("rooms", [])
         if not rooms:
             yield event.plain_result("当前没有配置任何直播间。")
@@ -715,8 +1022,8 @@ class BiliLiveMonitor(Star):
         # 记一下 UMO，方便排查"渲染成功但没发出去"
         try:
             logger.info(
-                f"[BiliLiveMonitor] liveinfo 触发，umo={getattr(event, 'unified_msg_origin', '')!r}, "
-                f"group={cur_gid!r}, all={show_all}"
+                f"[BiliLiveMonitor] {tag} 触发，umo={getattr(event, 'unified_msg_origin', '')!r}, "
+                f"group={cur_gid!r}, all={show_all}, image_only={image_only}"
             )
         except Exception:
             pass
@@ -747,8 +1054,17 @@ class BiliLiveMonitor(Star):
                         "bili_name": info.get("bili_name") or "",
                         "title": info.get("title") or "",
                         "live_status": info.get("live_status", 0),
-                        "follower": info.get("follower") or 0,
-                        "watched_show": info.get("watched_show") or 0,
+                        # 计数类字段直接透传 None/0：0 是有意义的值（显示 0），
+                        # None 才渲染成 "—"。用 `or 0` 会把"拿不到"误报成 0。
+                        "follower": info.get("follower"),
+                        "watched_show": info.get("watched_show"),
+                        "likes": info.get("likes"),
+                        # 人气值（加权热度，**不是在线人数**）。
+                        # 查询类指令要的是"此刻的实时人气"，所以取实时抓取值，
+                        # **不用缓存峰值**（峰值是下播结算专用的口径）。
+                        # 与其它计数保持一致的 None 语义：None=没拿到 → 渲染 "—"，
+                        # 0 是有效值（真的是 0）→ 显示 0。不能用 `or 0` 吞掉 None。
+                        "online": info.get("online"),
                         "avatar_url": info.get("face") or "",
                         "room_id": room_id,
                     }
@@ -763,7 +1079,7 @@ class BiliLiveMonitor(Star):
                 yield event.plain_result(
                     f"本群（{cur_gid}）没有配置任何主播，请先在插件配置的 rooms 里"
                     f"把主播的推送群加上 {cur_gid}。\n"
-                    f"（管理员可发送 /liveinfoall 查看全部主播）"
+                    f"（管理员可发送 {all_cmd} 查看全部主播）"
                 )
             else:
                 yield event.plain_result("没有有效的直播间配置。")
@@ -782,23 +1098,33 @@ class BiliLiveMonitor(Star):
                     gap=6,
                 )
                 logger.info(
-                    f"[BiliLiveMonitor] liveinfo 长条图渲染成功"
+                    f"[BiliLiveMonitor] {tag} 长条图渲染成功"
                     f"（{len(strip_items)} 行，{len(strip_bytes)} bytes）"
                 )
             except Exception as e:
                 logger.error(
-                    f"[BiliLiveMonitor] liveinfo 长条图渲染失败，仅发文字: {e}",
+                    f"[BiliLiveMonitor] {tag} 长条图渲染失败，仅发文字: {e}",
                     exc_info=True,
                 )
 
         if strip_bytes:
             # 指令返回值就支持「文字 + 图片」：chain 必须是普通 list，
             # 绝不能传 MessageChain（result_decorate 会对 result.chain 做 len()）
-            comps = [Plain(text_all), Image.fromBytes(strip_bytes)]
+            if image_only:
+                comps = [Image.fromBytes(strip_bytes)]
+            else:
+                comps = [Plain(text_all), Image.fromBytes(strip_bytes)]
             result = self._build_image_result(event, comps)
             if result is not None:
                 yield result
                 return
+
+        # /livelist 系列只认图；图没渲染出来也要有回应，退回文字而不是装作没事
+        if image_only:
+            yield event.plain_result(
+                f"⚠️ 长条图渲染失败/未开启（render_card），以下是文字版：\n\n{text_all}"
+            )
+            return
 
         yield event.plain_result(text_all)
 
